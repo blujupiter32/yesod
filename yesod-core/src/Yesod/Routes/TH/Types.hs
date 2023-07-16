@@ -42,12 +42,18 @@ data Resource typ = Resource
 
 type CheckOverlap = Bool
 
-data Piece typ = Static String | Dynamic typ
+data Piece typ
+    = Static String
+    | Dynamic typ
+    | SizedDynamicMulti Int String
+    | DynamicMulti String
     deriving (Lift, Show)
 
 instance Functor Piece where
-    fmap _ (Static s)  = Static s
+    fmap _ (Static s) = Static s
     fmap f (Dynamic t) = Dynamic (f t)
+    fmap _ (SizedDynamicMulti n s) = SizedDynamicMulti n s
+    fmap _ (DynamicMulti s) = DynamicMulti s
 
 data Dispatch typ =
     Methods

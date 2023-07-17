@@ -55,4 +55,4 @@ jobs:
         run: |
             set -ex
             stack --version
-            stack test --fast --no-terminal ${{ matrix.args }}
+            stack test --fast --ghc-options '-ddump-splices' --no-terminal ${{ matrix.args }}

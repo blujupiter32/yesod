@@ -15,14 +15,15 @@ module Yesod.Routes.Parse
     ) where
 
 import Language.Haskell.TH.Syntax
-import Data.Char (isUpper, isLower, isSpace)
+import Data.Char (isUpper, isLower, isSpace, isDigit)
 import Language.Haskell.TH.Quote
 import qualified System.IO as SIO
 import Yesod.Routes.TH
 import Yesod.Routes.Overlap (findOverlapNames)
-import Data.List (foldl', isPrefixOf)
+import Data.List (foldl', mapAccumL, isPrefixOf, unfoldr)
 import Data.Maybe (mapMaybe)
 import qualified Data.Set as Set
+import Text.Read (readMaybe)
 
 -- | A quasi-quoter to parse a string into a list of 'Resource's. Checks for
 -- overlapping routes, failing if present; use 'parseRoutesNoCheck' to skip the
@@ -100,11 +101,15 @@ resourcesFromString =
                     , Just attrs <- mapM parseAttr rest ->
                     let (children, otherLines'') = parse (length spaces + 1) otherLines
                         children' = addAttrs attrs children
-                        (pieces, Nothing, check) = piecesFromStringCheck pattern
+                        (check, pieces) = piecesFromStringCheck pattern
                      in ((ResourceParent constr check pieces children' :), otherLines'')
                 (pattern:constr:rest) ->
-                    let (pieces, mmulti, check) = piecesFromStringCheck pattern
+                    let (check, pieces0) = piecesFromStringCheck pattern
                         (attrs, rest') = takeAttrs rest
+                        (pieces, mmulti)
+                            | not (null pieces0)
+                            , DynamicMulti s <- last pieces0 = (init pieces0, Just s)
+                            | otherwise = (pieces0, Nothing)
                         disp = dispatchFromString rest' mmulti
                      in ((ResourceLeaf (Resource constr pieces disp attrs check):), otherLines)
                 [] -> (id, otherLines)
@@ -113,11 +118,11 @@ resourcesFromString =
 -- | Splits a string by spaces, as long as the spaces are not enclosed by curly brackets (not recursive).
 splitSpaces :: String -> [String]
 splitSpaces "" = []
-splitSpaces str = 
+splitSpaces str =
     let (rest, piece) = parse $ dropWhile isSpace str in
     piece:(splitSpaces rest)
 
-    where 
+    where
         parse :: String -> ( String, String)
         parse ('{':s) = fmap ('{':) $ parseBracket s
         parse (c:s) | isSpace c = (s, [])
@@ -130,18 +135,10 @@ splitSpaces str =
         parseBracket (c:s) = fmap (c:) $ parseBracket s
         parseBracket "" = error $ "Invalid resource line (unclosed curly bracket): " ++ str
 
-piecesFromStringCheck :: String -> ([Piece String], Maybe String, Bool)
-piecesFromStringCheck s0 =
-    (pieces, mmulti, check)
+piecesFromStringCheck :: String -> (CheckOverlap, [Piece String])
+piecesFromStringCheck = mapAccumL go True . piecesFromString . drop1Slash
   where
-    (s1, check1) = stripBang s0
-    (pieces', mmulti') = piecesFromString $ drop1Slash s1
-    pieces = map snd pieces'
-    mmulti = fmap snd mmulti'
-    check = check1 && all fst pieces' && maybe True fst mmulti'
-
-    stripBang ('!':rest) = (rest, False)
-    stripBang x = (x, True)
+    go check (checkPiece, piece) = (check && checkPiece, piece)
 
 addAttrs :: [String] -> [ResourceTree String] -> [ResourceTree String]
 addAttrs attrs =
@@ -189,17 +186,13 @@ drop1Slash :: String -> String
 drop1Slash ('/':x) = x
 drop1Slash x = x
 
-piecesFromString :: String -> ([(CheckOverlap, Piece String)], Maybe (CheckOverlap, String))
-piecesFromString "" = ([], Nothing)
-piecesFromString x =
-    case (this, rest) of
-        (Left typ, ([], Nothing)) -> ([], Just typ)
-        (Left _, _) -> error "Multipiece must be last piece"
-        (Right piece, (pieces, mtyp)) -> (piece:pieces, mtyp)
+piecesFromString :: String -> [(CheckOverlap, Piece String)]
+piecesFromString = unfoldr (go . break (== '/'))
   where
-    (y, z) = break (== '/') x
-    this = pieceFromString y
-    rest = piecesFromString $ drop 1 z
+    go ("", "") = Nothing
+    go (x, y) = case (pieceFromString x, drop1Slash y) of
+        ((_, DynamicMulti _), _:_) -> error "Multipiece must be last piece"
+        (piece, rest) -> Just (piece, rest)
 
 parseType :: String -> Type
 parseType orig =
@@ -273,22 +266,29 @@ isTvar :: String -> Bool
 isTvar (h:_) = isLower h
 isTvar _     = False
 
-pieceFromString :: String -> Either (CheckOverlap, String) (CheckOverlap, Piece String)
-pieceFromString ('#':'!':x) = Right $ (False, Dynamic $ dropBracket x)
-pieceFromString ('!':'#':x) = Right $ (False, Dynamic $ dropBracket x) -- https://github.com/yesodweb/yesod/issues/652
-pieceFromString ('#':x) = Right $ (True, Dynamic $ dropBracket x)
+multiPieceFromString :: String -> Piece typ
+multiPieceFromString x = case readMaybe digits of
+    Just n -> SizedDynamicMulti n rest
+    Nothing -> DynamicMulti rest
+  where
+    (digits, rest) = span isDigit x
 
-pieceFromString ('*':'!':x) = Left (False, x)
-pieceFromString ('+':'!':x) = Left (False, x)
+pieceFromString :: String -> (CheckOverlap, Piece String)
+pieceFromString ('#':'!':x) = (False, Dynamic $ dropBracket x)
+pieceFromString ('!':'#':x) = (False, Dynamic $ dropBracket x) -- https://github.com/yesodweb/yesod/issues/652
+pieceFromString ('#':x) = (True, Dynamic $ dropBracket x)
 
-pieceFromString ('!':'*':x) = Left (False, x)
-pieceFromString ('!':'+':x) = Left (False, x)
+pieceFromString ('*':'!':x) = (False, multiPieceFromString x)
+pieceFromString ('+':'!':x) = (False, multiPieceFromString x)
 
-pieceFromString ('*':x) = Left (True, x)
-pieceFromString ('+':x) = Left (True, x)
+pieceFromString ('!':'*':x) = (False, multiPieceFromString x)
+pieceFromString ('!':'+':x) = (False, multiPieceFromString x)
 
-pieceFromString ('!':x) = Right $ (False, Static x)
-pieceFromString x = Right $ (True, Static x)
+pieceFromString ('*':x) = (True, multiPieceFromString x)
+pieceFromString ('+':x) = (True, multiPieceFromString x)
+
+pieceFromString ('!':x) = (False, Static x)
+pieceFromString x = (True, Static x)
 
 dropBracket :: String -> String
 dropBracket str@('{':x) = case break (== '}') x of
